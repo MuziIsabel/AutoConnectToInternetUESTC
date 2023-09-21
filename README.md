@@ -38,6 +38,7 @@ pyinstaller -F -w internetconnectuestc.py
 2. 输入`shell:startup`，这将会打开“启动”文件夹
 3. 把自己的exe文件（或快捷方式）放进去
 4. 完成！这样你就可以在任务管理器里看到自己的程序被成功添加为自启动项了
+
 *Windows11系统，其他版本自行测试
 
 ## 存在的问题
