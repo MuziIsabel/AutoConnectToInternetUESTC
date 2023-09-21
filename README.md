@@ -3,7 +3,7 @@
 电子科技大学校园网电信手机认证自动登录脚本
 
 ## 介绍
-本项目是基于[Auto-Connect-Net-UESTC](https://github.com/innns/Auto-Connect-Net-UESTC)修改而来，主要添加了对于电信校园网的手机认证支持。
+本项目是基于[Auto-Connect-Net-UESTC](https://github.com/innns/Auto-Connect-Net-UESTC)修改而来，主要修改并实现了对于电信校园网的手机认证支持。
 
 ## 如何使用
 本项目基于`python3.11.5`建立
