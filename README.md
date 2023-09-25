@@ -11,7 +11,8 @@
 配置 WebDriver，需要选择对应版本的 WebDriver
 
 [msedgedriver.exe](https://developer.microsoft.com/zh-cn/microsoft-edge/tools/webdriver/)文件请放在AutoConnectToInternetUESTC文件夹里
-**重要提示：在打包好internetconnectuestc.exe文件后，请将msedgedriver.exe放入同一文件夹中（默认位置为\AutoConnectToInternetUESTC\dist）；或者你也可以修改代码自行指定msedgedriver.exe文件的存放位置**
+
+> **重要提示：在打包好internetconnectuestc.exe文件后，请将msedgedriver.exe放入同一文件夹中（默认位置为\AutoConnectToInternetUESTC\dist）；或者你也可以修改代码自行指定msedgedriver.exe文件的存放位置**
 
 请自行检查依赖，包括selenium,ping3和time模块
 ```shell
