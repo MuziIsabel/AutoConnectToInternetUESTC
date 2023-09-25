@@ -42,7 +42,7 @@ if __name__ == "__main__":
                 # from selenium.webdriver.chrome.service import Service as Se
                 print("Using Edge")
 
-                Se = Service('msedgedriver.exe')
+                Se = Service('msedgedriver.exe')#msedgedriver.exe文件存放位置
                 options = webdriver.EdgeOptions()
                 options.add_argument("--headless")
                 options.add_argument("--disable-gpu")
