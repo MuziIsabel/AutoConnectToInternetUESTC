@@ -44,5 +44,6 @@ pyinstaller -F -w internetconnectuestc.py
 （测试使用Windows11系统，其他版本自行测试）
 
 ## 存在的问题
-1.当程序启动，重新连接网络时会弹出控制台，等待连接完成关闭即可~
-2.如果运行过程中唤起控制台后报错，是你的edge更新了新版本导致的，请及时更新你的WebDriver[msedgedriver.exe](https://developer.microsoft.com/zh-cn/microsoft-edge/tools/webdriver/)，才能支持最新版本的edge；或者你也可以关闭edge的自动更新。
+1. 当程序启动，重新连接网络时会弹出控制台，等待连接完成关闭即可~
+
+2. 如果运行过程中唤起控制台后报错，是你的edge更新了新版本导致的，请及时更新你的WebDriver[msedgedriver.exe](https://developer.microsoft.com/zh-cn/microsoft-edge/tools/webdriver/)，才能支持最新版本的edge；或者你也可以关闭edge的自动更新。
