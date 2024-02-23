@@ -25,7 +25,7 @@ pip install -r requirements.txt
 ```
 
 ## 3. 打包为exe文件
-1. 控制台中使用`cd`命令定位到AutoConnectToInternetUESTC文件夹
+1. 在终端中使用`cd`命令定位到AutoConnectToInternetUESTC文件夹
 2. 运行下面的命令，没安装`pyinstaller`的安装一下
    ```shell
    pyinstaller -F -w internetconnectuestc.py
