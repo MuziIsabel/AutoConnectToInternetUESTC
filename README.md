@@ -2,46 +2,40 @@
 
 电子科技大学校园网电信手机认证自动登录脚本
 
-## 介绍
-本项目是基于[Auto-Connect-Net-UESTC](https://github.com/innns/Auto-Connect-Net-UESTC)修改而来，主要修改并实现了对于电信校园网的手机认证支持。
-
-## 如何使用
-本项目基于`python3.11.5`建立
-
-配置 WebDriver，需要选择对应版本的 WebDriver
-
-[msedgedriver.exe](https://developer.microsoft.com/zh-cn/microsoft-edge/tools/webdriver/)文件请放在AutoConnectToInternetUESTC文件夹里
-
-> **重要提示：在打包好internetconnectuestc.exe文件后，请将msedgedriver.exe放入同一文件夹中（默认位置为\AutoConnectToInternetUESTC\dist）；或者你也可以修改代码自行指定msedgedriver.exe文件的存放位置**
-
-请自行检查依赖，包括selenium,ping3和time模块
-```shell
-pip install selenium
-pip install ping3
-```
-默认支持每10s检测一次网络，三次无连接则重连。
+## 1. 介绍
+- **适用于宿舍有线电信的网页手机认证**
+- 本项目是基于[Auto-Connect-Net-UESTC](https://github.com/innns/Auto-Connect-Net-UESTC)修改而来，主要修改并实现了对于电信校园网的手机认证支持。
+- 默认支持每10s检测一次网络，三次无连接则重连。
 添加账号密码即可运行。
 
-
-## 测试环境
-宿舍有线电信，采用网页手机认证。
-
-## 打包为exe文件
-1. 控制台中使用`cd`命令定位到AutoConnectToInternetUESTC文件夹
-2. 运行下面的命令，记得检查是否安装了`pyinstaller`
+## 2. 如何使用
+本项目基于`python3.11.5`建立
+> **重要提示：第一次运行时请在有网络的环境下运行，程序会在启动时自动下载WebDriver文件。**
+> **之后程序会在电脑日期发生变更时下载最新的[WebDriver](https://developer.microsoft.com/zh-cn/microsoft-edge/tools/webdriver/)文件**
+> *为了解决因edge浏览器自动更新而失效的问题，因此现在不用禁止edge浏览器自动更新也可以使用
+### 2.1 一键下载
+下载安装`requirements.txt`文件中描述的依赖，包括selenium,ping3和webdriver_manager模块
 ```shell
-pyinstaller -F -w internetconnectuestc.py
+pip install -r requirements.txt
 ```
+
+
+## 3. 打包为exe文件
+1. 控制台中使用`cd`命令定位到AutoConnectToInternetUESTC文件夹
+2. 运行下面的命令，没安装`pyinstaller`的安装一下
+   ```shell
+   pyinstaller -F -w internetconnectuestc.py
+   ```
 3. exe文件生成到了dist文件夹里
 
-## 添加打包好的exe文件到开机自启动
+## 4. 添加打包好的exe文件到开机自启动
 
 1. `win+R`打开`运行`
 2. 输入`shell:startup`，这将会打开“启动”文件夹
 3. 把自己的exe文件的快捷方式放进去
 4. 完成！这样你就可以在任务管理器里看到自己的程序被成功添加为自启动项了
 
-（测试使用Windows11系统，其他版本自行测试）
-
-## 存在的问题
-当程序启动，重新连接网络时会弹出控制台，等待连接完成关闭即可~
+## 5. 其他问题
+- 如果被Windows自带的防火墙误删了，请手动添加为排除项。
+  >"Windows安全中心"->"病毒和威胁防护"->"添加或删除排除项"，将exe文件添加进去即可
+- 如果使用的代理软件，请将`aaa.uestc.edu.cn`添加到代理排除项。
