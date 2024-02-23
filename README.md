@@ -18,7 +18,11 @@
 ```shell
 pip install -r requirements.txt
 ```
-
+### 2.2 在代码中填写你的手机号和密码
+```python
+  PHONENUM = "191********"  # 手机号
+  PASSWD = "********"  # 密码
+```
 
 ## 3. 打包为exe文件
 1. 控制台中使用`cd`命令定位到AutoConnectToInternetUESTC文件夹
