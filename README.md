@@ -1,6 +1,6 @@
 # AutoConnectToInternetUESTC
 
-电子科技大学校园网电信手机认证自动登录脚本
+电子科技大学校园网电信手机认证自动登录脚本 V2.0
 
 ## 1. 介绍
 - **适用于宿舍有线电信的网页手机认证**
@@ -14,13 +14,13 @@
 > **之后程序会在电脑日期发生变更时下载最新的[WebDriver](https://developer.microsoft.com/zh-cn/microsoft-edge/tools/webdriver/)文件**
 > *为了解决因edge浏览器自动更新而失效的问题，因此现在不用禁止edge浏览器自动更新也可以使用
 ### 2.1 一键下载
-下载安装`requirements.txt`文件中描述的依赖，包括selenium,ping3和webdriver_manager模块
+下载安装`requirements.txt`文件中描述的依赖
 ```shell
 pip install -r requirements.txt
 ```
 ### 2.2 在代码中填写你的手机号和密码
 ```python
-  PHONENUM = "191********"  # 手机号
+  PHONENUM = "**************"  # 手机号
   PASSWD = "********"  # 密码
 ```
 
@@ -42,4 +42,4 @@ pip install -r requirements.txt
 ## 5. 其他问题
 - 如果被Windows自带的防火墙误删了，请手动添加为排除项。
   >"Windows安全中心"->"病毒和威胁防护"->"添加或删除排除项"，将exe文件添加进去即可
-- 如果使用的代理软件，请将`aaa.uestc.edu.cn`添加到代理排除项。
+- 如果使用的代理软件，现在无须担心，认证时会自动跳过代理。
