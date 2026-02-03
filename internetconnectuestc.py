@@ -295,13 +295,21 @@ if __name__ == "__main__":
                 options = webdriver.EdgeOptions()
                 options.add_argument("--headless")
                 options.add_argument("--disable-gpu")
-                
-                # --- 新增的魔法代码 ---
-                # 这个参数告诉浏览器实例忽略所有代理，进行直接网络连接
-                options.add_argument("--no-proxy-server")
-                
-                driver = webdriver.Edge(service=Se, options=options)
+
+                # 禁用各种网络相关的功能，避免断网时启动失败
+                options.add_argument("--no-proxy-server")  # 忽略代理设置
+                options.add_argument("--disable-background-networking")  # 禁用后台网络请求
+                options.add_argument("--disable-sync")  # 禁用同步
+                options.add_argument("--disable-extensions")  # 禁用扩展
+                options.add_argument("--disable-default-apps")  # 禁用默认应用
+                options.add_argument("--disable-component-update")  # 禁用组件更新
+                options.add_argument("--disable-features=NetworkService")  # 禁用网络服务
+                options.add_argument("--disable-domain-reliability")  # 禁用域名可靠性监控
+                options.add_argument("--disable-client-side-phishing-detection")  # 禁用钓鱼检测
+
+                driver = None
                 try:
+                    driver = webdriver.Edge(service=Se, options=options)
                     driver.get("http://aaa.uestc.edu.cn/")
                     cnt.logger.info("连接中... 小孤独在努力连接中... (。・ω・。)")
                     user_input = driver.find_element(by=By.XPATH, value='//*[@id="username"]')
@@ -315,14 +323,14 @@ if __name__ == "__main__":
                     driver.quit()
                     time.sleep(1)
                     cnt.logger.info("连接成功!!! 喜多酱的吉他连接成功了！o((>ω< ))o")
-                except Exception as e:
-                    cnt.logger.info(f"认证过程中发生错误: {e} 波奇酱搞砸了... (´；ω；`)")
-                    # 如果认证失败，可以考虑关闭driver
-                    try:
-                        driver.quit()
-                    except:
-                        pass
-                else:
                     cnterror = 0
+                except Exception as e:
+                    cnt.logger.error(f"认证过程中发生错误: {e} 波奇酱搞砸了... (´；ω；`)")
+                    # 如果认证失败，关闭driver（如果已创建）
+                    if driver is not None:
+                        try:
+                            driver.quit()
+                        except:
+                            pass
             time.sleep(cnt.waitime)
         time.sleep(cnt.waitime)
