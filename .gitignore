@@ -1,0 +1,12 @@
+.claude/
+__pycache__/
+*.py[cod]
+*.log
+
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Downloaded WebDriver
+driver/
