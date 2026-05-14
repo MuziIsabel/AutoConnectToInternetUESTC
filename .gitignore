@@ -4,10 +4,22 @@ __pycache__/
 *.py[cod]
 *.log
 
+# Local credentials / environment
+.env
+.env.*
+!.env.example
+
 # Build artifacts
 dist/
 build/
 *.spec
 
-# Downloaded WebDriver
+# Old Selenium/WebDriver artifacts
 driver/
+edgedriver_win64.zip
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

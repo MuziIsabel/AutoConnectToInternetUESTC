@@ -1,440 +1,646 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+校园网自动认证 - requests版 (无 Selenium / WebDriver 依赖)
+当前仓库主实现。
+
+配置: 通过 .env 文件或环境变量设置
+  UESTC_PHONE       - 手机号
+  UESTC_PASSWORD    - 密码
+  UESTC_HOST        - ping探测地址 (默认 223.5.5.5)
+  UESTC_WAIT_TIME   - 检测间隔秒数 (默认 10)
+  UESTC_PORTAL_URL  - 认证页面地址 (默认 http://aaa.uestc.edu.cn/)
+"""
+
 import time
-import datetime
-import shutil
-import ping3
-from pathlib import Path
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.edge.service import Service
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    ElementNotVisibleException,
-    ElementNotInteractableException,
-    TimeoutException,
-    WebDriverException,
-)
+import os
+import sys
+import re
 import logging
+from pathlib import Path
+from typing import Optional, Tuple
+from dataclasses import dataclass, field
 
-# --- 新增的导入 ---
-import winreg  # 用于读取注册表来获取Edge版本
-import requests  # 用于网络请求
-from bs4 import BeautifulSoup  # 用于解析HTML
-from bs4.element import NavigableString, Tag
-from typing import Optional, cast
-import zipfile  # 用于处理zip文件
-import io  # 用于在内存中处理zip文件
-import subprocess
+import ping3
+import requests
+from bs4 import BeautifulSoup
 
 
-class connect:
-    PHONENUM = "********"  # 手机号
-    PASSWD = "********"  # 密码
-    host = "223.5.5.5"
-    waitime = 10
-    current_date = 0
+# ---------------------------------------------------------------------------
+# 环境变量 & CA证书
+# ---------------------------------------------------------------------------
+
+def _load_env_file(path: Path = Path(".env")) -> None:
+    if not path.exists():
+        return
+    try:
+        content = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _preload_requests_ca_bundle_env() -> None:
+    """在 import requests 之前设置 CA 证书路径 (PyInstaller 兼容)"""
+    try:
+        import certifi
+        ca_path = certifi.where()
+        if ca_path and Path(ca_path).exists():
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_path)
+            os.environ.setdefault("SSL_CERT_FILE", ca_path)
+            return
+    except Exception:
+        pass
+    meipass = getattr(sys, "_MEIPASS", None)
+    if isinstance(meipass, str) and meipass:
+        candidate = Path(meipass).joinpath("certifi", "cacert.pem")
+        if candidate.exists():
+            ca_path = str(candidate)
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_path)
+            os.environ.setdefault("SSL_CERT_FILE", ca_path)
+
+
+_preload_requests_ca_bundle_env()
+
+
+# ---------------------------------------------------------------------------
+# 常见门户认证端点 (按优先级排序)
+# ---------------------------------------------------------------------------
+
+# UESTC aaa.uestc.edu.cn 常见 AJAX 认证路径
+KNOWN_AUTH_ENDPOINTS = [
+    "/eportal/InterFace.do?method=login",
+    "/eportal/InterFace.do?method=loginByWeb",
+    "/eportal/gb/index.jsp",
+    "/ac_portal/default/portal.jsp",
+    "/",
+]
+
+
+# ---------------------------------------------------------------------------
+# HTML 表单解析器
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ParsedForm:
+    """从门户页面解析出的表单信息"""
+    action: str = ""
+    method: str = "POST"
+    username_field: str = "username"
+    password_field: str = "pwd"
+    hidden_fields: dict = field(default_factory=dict)
+    extra_data: dict = field(default_factory=dict)
+
+
+def parse_portal_html(html: str, base_url: str) -> Optional[ParsedForm]:
+    """
+    解析门户页面 HTML, 提取登录表单的结构.
+    返回 ParsedForm 或 None.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # 策略1: 找 <form> 标签
+    form_tag = soup.find("form")
+    if form_tag:
+        pf = ParsedForm()
+        pf.action = form_tag.get("action", "") or base_url
+        pf.method = (form_tag.get("method", "POST") or "POST").upper()
+
+        # 如果 action 是相对路径, 补全。既支持 /login，也支持 ./validateHaijun.do 这类写法。
+        from urllib.parse import urljoin
+        if not pf.action.lower().startswith(("http://", "https://")):
+            pf.action = urljoin(base_url, pf.action)
+
+        # 提取所有 hidden input
+        for inp in form_tag.find_all("input", {"type": "hidden"}):
+            name = inp.get("name")
+            value = inp.get("value", "")
+            if name:
+                pf.hidden_fields[name] = value
+
+        # 识别用户名/密码字段
+        for inp in form_tag.find_all("input"):
+            field_name = inp.get("name") or ""
+            name = field_name.lower()
+            id_attr = (inp.get("id") or "").lower()
+            input_type = (inp.get("type") or "").lower()
+
+            # 先识别密码字段，避免 userPassword 这类字段被 "user" 误判为用户名
+            is_password = (
+                input_type == "password"
+                or "pwd" in name
+                or "pass" in name
+                or "pwd" in id_attr
+                or "password" in id_attr
+            )
+            if is_password:
+                pf.password_field = field_name or "pwd"
+                continue
+
+            is_username = (
+                name in ("username", "user", "userid", "useraccount", "account")
+                or id_attr in ("username", "user", "userid", "useraccount", "account")
+                or ("user" in name and "pass" not in name and "pwd" not in name)
+                or ("user" in id_attr and "pass" not in id_attr and "pwd" not in id_attr)
+            )
+            if is_username:
+                pf.username_field = field_name or "username"
+
+        return pf
+
+    # 策略2: 没有 <form> 标签, 但有已知字段 (AJAX 模式)
+    username_el = soup.find(id="username") or soup.find(attrs={"name": "username"})
+    pwd_el = soup.find(id="pwd") or soup.find(attrs={"name": "pwd"})
+
+    if username_el or pwd_el:
+        pf = ParsedForm()
+        pf.action = base_url  # AJAX 模式下默认 POST 到同一页面或已知端点
+        return pf
+
+    return None
+
+
+def extract_js_login_endpoint(html: str) -> Optional[str]:
+    """
+    尝试从页面 JavaScript 中提取 AJAX 登录端点.
+    常见模式: $.post("/eportal/InterFace.do?method=login", ...)
+    """
+    patterns = [
+        r'(?:url|action|href)\s*[=:]\s*["\']([^"\']*(?:login|Login|interFace|Interface)[^"\']*)["\']',
+        r'\.post\s*\(\s*["\']([^"\']+)["\']',
+        r'\.ajax\s*\([^)]*url\s*:\s*["\']([^"\']+)["\']',
+        r'XMLHttpRequest[^;]*open\s*\(\s*["\']POST["\']\s*,\s*["\']([^"\']+)["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 主连接类
+# ---------------------------------------------------------------------------
+
+class ConnectRequests:
+    """基于 requests 的校园网自动认证 (无 Selenium 依赖)"""
 
     def __init__(self):
-        self.logger = self.log_config()
-        self.logger.info("自动网络认证已启动~~ 喜多酱的吉他开始演奏了！♪(´▽｀)")
-        self.driver_path = Path("driver").joinpath("msedgedriver.exe")
+        self.logger = self._log_config()
 
-        # 启动时就执行一次驱动更新检查
-        self.ensure_driver_updated()
+        _load_env_file()
+        self.PHONENUM = os.getenv("UESTC_PHONE", "").strip()
+        self.PASSWD = os.getenv("UESTC_PASSWORD", "")
+        self.host = os.getenv("UESTC_HOST", "223.5.5.5").strip()
+        self.waitime = int(os.getenv("UESTC_WAIT_TIME", "10").strip() or "10")
+        self.portal_url = os.getenv("UESTC_PORTAL_URL", "http://aaa.uestc.edu.cn/").strip()
 
-    def get_edge_version(self):
-        """通过查询注册表获取本地Edge浏览器的版本号"""
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0"
+            ),
+            # 部分校园网门户会在未声明 Content-Encoding 的情况下返回压缩内容，
+            # 明确要求 identity 可以减少乱码页面导致的误判。
+            "Accept-Encoding": "identity",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        })
+        # 不验证 SSL (门户可能自签证书)
+        self.session.verify = False
+
+        self._ensure_ca_bundle()
+
+        if not self.PHONENUM or not self.PASSWD:
+            self.logger.error(
+                "未设置账号密码环境变量：请设置 UESTC_PHONE / UESTC_PASSWORD 后再运行。"
+            )
+            raise SystemExit(2)
+
+        self.logger.info("校园网自动认证(requests版)已启动 ♪(´▽｀)")
+
+    # --- 辅助方法 ---
+
+    def _ensure_ca_bundle(self):
+        """确保 HTTPS 证书路径可用 (PyInstaller 兼容)"""
         try:
-            # 打开Edge的注册表键
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Edge\BLBeacon"
-            )
-            # 读取名为 "version" 的值
-            version, _ = winreg.QueryValueEx(key, "version")
-            self.logger.info(
-                f"成功检测到本地Edge浏览器版本: {version} 小孤独的浏览器版本呢~ (´• ω •`)"
-            )
-            return version
-        except FileNotFoundError:
-            self.logger.error(
-                "未在注册表中找到Edge浏览器版本信息。 波奇酱躲在角落里发抖了... (´；ω；`)"
-            )
-            return None
-        except Exception as e:
-            self.logger.error(
-                f"读取Edge版本时发生未知错误: {e} 凉酱也不知道该怎么办了... (⊙﹏⊙)"
-            )
-            return None
+            import certifi
+            ca_path = certifi.where()
+            if ca_path and Path(ca_path).exists():
+                os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_path)
+                os.environ.setdefault("SSL_CERT_FILE", ca_path)
+                try:
+                    import requests.adapters as ra
+                    import requests.utils as ru
+                    ra.DEFAULT_CA_BUNDLE_PATH = ca_path
+                    ru.DEFAULT_CA_BUNDLE_PATH = ca_path
+                except Exception:
+                    pass
+        except ImportError:
+            self.logger.warning("certifi 未安装, HTTPS 可能受影响")
 
-    def get_local_driver_version(self):
-        """通过执行 msedgedriver.exe --version 获取本地驱动的版本号"""
-        if not self.driver_path.exists():
-            self.logger.warning(
-                f"驱动文件 {self.driver_path} 不存在。虹夏酱找不到了... (。﹏。*)"
-            )
-            return None
-        try:
-            # 使用 subprocess 模块执行命令并捕获输出
-            # 添加 CREATE_NO_WINDOW 标志以防止控制台窗口闪烁
-            result = subprocess.run(
-                [str(self.driver_path), "--version"],
-                capture_output=True,
-                text=True,
-                check=True,
-                encoding="utf-8",
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            # 输出格式: "Microsoft Edge WebDriver 140.0.3485.54 (3cc379a8a5fb6b704b2169c01830296ed862ce0d)"
-            # 我们需要提取版本号部分
-            version_str = result.stdout.strip()
-            self.logger.debug(f"驱动版本输出: {version_str}")
-
-            # 使用正则表达式提取版本号
-            import re
-
-            version_match = re.search(r"(\d+\.\d+\.\d+\.\d+)", version_str)
-            if version_match:
-                version = version_match.group(1)
-                self.logger.debug(f"使用正则表达式解析到的驱动版本: {version}")
-                self.logger.info(
-                    f"成功获取到本地驱动版本: {version} 喜多酱的吉他调好音了！o(￣▽￣)o"
-                )
-                return version
-
-            # 如果正则表达式方法不行，尝试按空格分割
-            parts = version_str.split()
-            if len(parts) > 2 and "WebDriver" in parts[1]:
-                version = parts[2]  # "Microsoft Edge WebDriver 140.0..."
-                self.logger.debug(f"解析到的驱动版本: {version}")
-                self.logger.info(
-                    f"成功获取到本地驱动版本: {version} 喜多酱的吉他调好音了！o(￣▽￣)o"
-                )
-                return version
-            elif len(parts) > 1:
-                version = parts[1]  # "EdgeDriver 140.0..." 或 "Edge 140.0..."
-                self.logger.debug(f"解析到的驱动版本: {version}")
-                self.logger.info(
-                    f"成功获取到本地驱动版本: {version} 喜多酱的吉他调好音了！o(￣▽￣)o"
-                )
-                return version
-
-            self.logger.warning(
-                f"无法从输出中解析版本号: {version_str} 波奇酱搞不懂了... (´• ω •`)"
-            )
-            return version_str  # 作为最后的备用
-        except (subprocess.CalledProcessError, FileNotFoundError, IndexError) as e:
-            self.logger.error(f"获取本地驱动版本失败: {e} 凉也不知道该怎么办... (⊙﹏⊙)")
-            return None
-
-    def update_driver(self):
-        """核心功能：实现驱动的自动下载和更新 (最终精确版)"""
-        local_version = self.get_edge_version()
-        if not local_version:
-            self.logger.error(
-                "无法获取本地Edge版本，更新过程终止。波奇酱不知道该怎么办了... (´；ω；`)"
-            )
-            return False
-
-        try:
-            # 1. 访问微软官方WebDriver页面
-            url = (
-                "https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/"
-            )
-            self.logger.info(
-                f"正在访问WebDriver官网: {url} 喜多酱要努力查找驱动了！٩(ˊᗜˋ*)و"
-            )
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0"
-            }
-            response = requests.get(url, headers=headers, timeout=20)
-            response.raise_for_status()
-
-            # 2. 使用精确的解析逻辑
-            self.logger.info(
-                "使用针对当前官网结构的精确解析逻辑... 虹夏酱要仔细查找了！(￣▽￣)"
-            )
-            soup = BeautifulSoup(response.text, "lxml")
-            download_url: Optional[str] = None
-
-            # 寻找所有包含版本信息的父级div
-            version_blocks = soup.find_all("div", class_="block-web-driver__versions")
-            if not version_blocks:
-                self.logger.error(
-                    "在页面中未能找到任何 'block-web-driver__versions' 的区块，页面结构可能已改变。凉酱也搞不懂了... (⊙﹏⊙)"
-                )
-                return False
-
-            for block in version_blocks:
-                # 在区块内，版本号是 <strong> 标签的下一个兄弟节点
-                # 我们需要获取这个文本节点并去除首尾空格
-                block = cast(Tag, block)
-                strong_tag = block.find("strong")
-                if not isinstance(strong_tag, Tag):
-                    continue
-
-                version_text_node = strong_tag.next_sibling
-                if isinstance(version_text_node, NavigableString):
-                    page_version = str(version_text_node).strip()
-                    self.logger.debug(
-                        f"检测到页面上的版本: '{page_version}' 小孤独在仔细检查... (´• ω •`)"
-                    )
-
-                    # 检查页面上的版本是否与本地版本匹配
-                    if page_version == local_version:
-                        self.logger.info(
-                            f"成功匹配到版本 {local_version}! 喜多酱找到了！o(≧∇≦o)"
-                        )
-                        # 在当前区块内寻找 x64 的下载链接
-                        # 最可靠的方法是寻找 href 中包含 "win64.zip" 的链接
-                        link_tag = block.find(
-                            "a",
-                            attrs={
-                                "href": lambda href: isinstance(href, str)
-                                and "edgedriver_win64.zip" in href
-                            },
-                        )
-
-                        if isinstance(link_tag, Tag):
-                            href_value = link_tag.get("href")
-                            if isinstance(href_value, list):
-                                href_value = href_value[0] if href_value else None
-                            if isinstance(href_value, str):
-                                download_url = href_value
-                                self.logger.info(
-                                    f"成功找到 x64 下载链接: {download_url} 太棒了！(*^▽^*)"
-                                )
-                                break  # 找到后就跳出循环
-                        else:
-                            self.logger.warning(
-                                "匹配到版本但未找到 x64 下载链接。波奇酱有点困惑... (´• ω •`)"
-                            )
-
-            if not download_url:
-                self.logger.error(
-                    f"在官网未找到与本地版本 {local_version} 匹配的 x64 驱动下载链接。凉酱也找不到... (；´д｀)ゞ"
-                )
-                return False
-
-            # 3. 下载、解压流程 (这部分不变)
-            self.logger.info(
-                f"正在下载驱动文件: {download_url} 喜多酱要努力下载了！٩(ˊᗜˋ*)و"
-            )
-            driver_zip_response = requests.get(download_url, timeout=60)
-            driver_zip_response.raise_for_status()
-
-            self.logger.info("下载完成，正在解压... 虹夏酱要小心解压哦！(￣▽￣)")
-            temp_dir = Path("temp_driver")
-            temp_dir.mkdir(exist_ok=True)
-
-            with zipfile.ZipFile(io.BytesIO(driver_zip_response.content)) as zf:
-                for member in zf.infolist():
-                    if member.filename.endswith("msedgedriver.exe"):
-                        zf.extract(member, temp_dir)
-                        extracted_path = temp_dir / member.filename
-                        self.logger.info(
-                            f"文件已解压到: {extracted_path} 解压成功！o(≧∇≦o)"
-                        )
-
-                        # 确保目标目录存在
-                        self.driver_path.parent.mkdir(parents=True, exist_ok=True)
-
-                        # 如果目标文件已存在，先删除它
-                        if self.driver_path.exists():
-                            try:
-                                self.driver_path.unlink()
-                                self.logger.info(
-                                    "已删除旧的驱动文件 旧驱动再见啦！~(￣▽￣)~"
-                                )
-                            except Exception as e:
-                                self.logger.error(
-                                    f"删除旧驱动文件失败: {e} 波奇酱删除失败了... (´；ω；`)"
-                                )
-
-                        # 移动文件
-                        try:
-                            shutil.move(str(extracted_path), str(self.driver_path))
-                            self.logger.info(
-                                f"驱动已成功更新并放置在: {self.driver_path} 驱动搬家成功！o(≧∇≦o)"
-                            )
-
-                            # 验证文件是否真的存在
-                            if self.driver_path.exists():
-                                self.logger.info(
-                                    "验证：驱动文件已成功保存到目标位置 喜多酱完成任务了！٩(ˊᗜˋ*)و"
-                                )
-                            else:
-                                self.logger.error(
-                                    "错误：驱动文件未能成功保存到目标位置 波奇酱搞砸了... (´；ω；`)"
-                                )
-                                return False
-
-                            # 清理临时目录
-                            shutil.rmtree(temp_dir)
-                            return True
-                        except Exception as e:
-                            self.logger.error(
-                                f"移动驱动文件失败: {e} 凉也不知道该怎么办... (⊙﹏⊙)"
-                            )
-                            return False
-
-            self.logger.error(
-                "在下载的压缩包中未找到 msedgedriver.exe 文件。波奇酱找不到文件... (´；ω；`)"
-            )
-            return False
-
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"网络请求失败: {e} 网络连接出问题了... (っ °Д °;)っ")
-            return False
-        except Exception as e:
-            self.logger.error(
-                f"驱动更新过程中发生未知错误: {e} 小孤独也不知道该怎么办... (；´д｀)ゞ"
-            )
-            return False
-
-    def ensure_driver_updated(self):
-        """检查驱动是否存在且版本是否匹配，仅在需要时尝试更新"""
-        folder_path_methode = Path("driver")
-        if not folder_path_methode.exists():
-            folder_path_methode.mkdir()
-            self.logger.info("driver文件夹已创建~ 虹夏酱创建新文件夹啦！(￣▽￣)")
-
-        # 检查网络连接
-        if self.isConnectedNet() != 0:
-            self.logger.warning(
-                "网络未连接，无法检查驱动更新。将使用已有的驱动（如果存在）。波奇酱没有网络了... (´；ω；`)"
-            )
-            return
-
-        # --- 核心优化逻辑 ---
-        required_version = self.get_edge_version()
-        if not required_version:
-            self.logger.error(
-                "无法获取Edge浏览器版本，跳过驱动更新检查。凉酱也不知道版本... (⊙﹏⊙)"
-            )
-            return
-
-        local_driver_version = self.get_local_driver_version()
-
-        if local_driver_version == required_version:
-            self.logger.info(
-                f"本地驱动版本 ({local_driver_version}) 与浏览器版本匹配，无需更新。 喜多酱的吉他调好音了！o(￣▽￣)d"
-            )
-            self.current_date = datetime.date.today()  # 标记今天已检查
-            return
-
-        self.logger.info(
-            f"驱动版本不匹配或不存在 (本地: {local_driver_version}, 需要: {required_version})。小孤独需要更新驱动了... (´• ω •`)"
-        )
-        self.logger.info("开始执行驱动自动更新流程... 喜多酱要努力更新了！٩(ˊᗜˋ*)و")
-
-        if self.update_driver():
-            self.logger.info("驱动更新流程成功完成。喜多酱太厉害了！o(≧∇≦o)")
-            self.current_date = datetime.date.today()  # 记录更新日期
-        else:
-            self.logger.error(
-                "驱动更新流程失败。将尝试使用旧的驱动文件（如果存在）。波奇酱更新失败了... (´；ω；`)"
-            )
-
-    def isConnectedNet(self):
-        # ... (这部分代码保持不变) ...
-        response_time = ping3.ping(self.host)
-        if response_time is not None:
-            self.logger.debug("好耶~网络连接正常~~ 喜多酱可以上网了！(●'◡'●)")
-            return 0
-        else:
-            self.logger.info("完蛋，没有网络连接了！波奇酱断网了... (っ °Д °;)っ")
-            return 2
-
-    def log_config(self):
-        # ... (这部分代码保持不变) ...
-        logging.basicConfig(
-            filename="BOCCHI THE ROCK.log",
-            filemode="w",
-            format="%(asctime)s %(name)s:%(levelname)s:%(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-            level=logging.INFO,
-            encoding="utf-8",
-        )
+    def _log_config(self) -> logging.Logger:
         logger = logging.getLogger("BOCCHI")
+        logger.setLevel(logging.DEBUG)  # logger 本身接收所有级别
+
+        # 是否开启 DEBUG 模式: 环境变量 UESTC_DEBUG=1 或命令行 --debug
+        debug_mode = os.getenv("UESTC_DEBUG", "").strip() in ("1", "true", "yes")
+        if "--debug" in sys.argv:
+            debug_mode = True
+        console_level = logging.DEBUG if debug_mode else logging.INFO
+
+        # ---- 文件 handler (始终 DEBUG 级别) ----
+        fh = logging.FileHandler(
+            "BOCCHI THE ROCK.log", mode="w", encoding="utf-8"
+        )
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(name)s:%(levelname)s:%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logger.addHandler(fh)
+
+        # ---- 控制台 handler ----
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(console_level)
+        ch.setFormatter(logging.Formatter(
+            "[%(asctime)s] %(levelname)-5s %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        logger.addHandler(ch)
+
+        if debug_mode:
+            logger.info("DEBUG 模式已启用 (文件+控制台均 DEBUG)")
+        else:
+            logger.debug("控制台 INFO 级别; 文件 DEBUG 级别 (设置 UESTC_DEBUG=1 开启控制台 DEBUG)")
+
         return logger
 
+    # --- HTTP 请求/响应追踪 ---
 
-# --- main 部分的代码保持不变 ---
-if __name__ == "__main__":
-    cnt = connect()
-    while True:
-        cnterror = 0
-        new_date = datetime.date.today()
+    def _log_response(self, resp: requests.Response, label: str = "") -> None:
+        """详细记录 HTTP 响应信息 (DEBUG 级别)"""
+        prefix = f"[{label}] " if label else ""
+        self.logger.debug(
+            f"{prefix}<<< 响应: {resp.status_code} {resp.reason} | "
+            f"url={resp.url} | len={len(resp.text)} | "
+            f"encoding={resp.encoding}"
+        )
+        # 记录响应头 (关键字段)
+        interesting_headers = [
+            "Content-Type", "Content-Encoding", "Content-Length",
+            "Set-Cookie", "Location", "Server",
+        ]
+        hdrs = {k: v for k, v in resp.headers.items() if k in interesting_headers}
+        if hdrs:
+            self.logger.debug(f"{prefix}    响应头: {hdrs}")
+        # 截断记录响应体 (前 500 字符)
+        body_preview = resp.text[:500].replace("\n", "\\n").replace("\r", "")
+        self.logger.debug(f"{prefix}    响应体(前500): {body_preview}")
 
-        # 检查是否跨天了，如果跨天了就再执行一次更新检查
-        if (new_date != cnt.current_date) and (cnt.isConnectedNet() == 0):
-            cnt.logger.info(
-                "新的一天开始了，检查驱动是否需要更新... 虹夏酱要开始新的一天了！(￣▽￣)"
-            )
-            cnt.ensure_driver_updated()
+    def _log_request_summary(self, method: str, url: str, **kwargs) -> None:
+        """记录即将发出的 HTTP 请求摘要 (DEBUG 级别)"""
+        data = kwargs.get("data") or kwargs.get("json") or kwargs.get("params")
+        data_desc = ""
+        if data:
+            # 隐藏密码字段
+            safe = {}
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if any(p in k.lower() for p in ("pwd", "pass", "password")):
+                        safe[k] = "***"
+                    else:
+                        safe[k] = v
+                data_desc = str(safe)[:200]
+            else:
+                data_desc = str(data)[:200]
+        self.logger.debug(f">>> {method} {url} | data={data_desc}")
 
-        while cnt.isConnectedNet() != 0:
-            cnterror += 1
-            if cnterror >= 3:
-                cnt.logger.info(r"正在打开Edge... 喜多酱要打开浏览器了！¯\_(ツ)_/¯")
-                if not cnt.driver_path.exists():
-                    cnt.logger.error(
-                        "找不到msedgedriver.exe文件，并且自动更新失败！请检查网络或手动下载。波奇酱找不到驱动了... (´；ω；`)"
-                    )
-                    time.sleep(cnt.waitime * 5)
-                    break
 
-                Se = Service(str(cnt.driver_path))
-                options = webdriver.EdgeOptions()
-                options.add_argument("--headless")
-                options.add_argument("--disable-gpu")
+    def _log_auth_decision(self, strategy: str, success: bool, detail: str = "") -> None:
+        """记录认证决策链的每一步结果"""
+        status = "SUCCESS" if success else "FAIL"
+        self.logger.debug(f"决策链: [{status}] {strategy} | {detail}")
 
-                # 禁用各种网络相关的功能，避免断网时启动失败
-                options.add_argument("--no-proxy-server")  # 忽略代理设置
-                options.add_argument(
-                    "--disable-background-networking"
-                )  # 禁用后台网络请求
-                options.add_argument("--disable-sync")  # 禁用同步
-                options.add_argument("--disable-extensions")  # 禁用扩展
-                options.add_argument("--disable-default-apps")  # 禁用默认应用
-                options.add_argument("--disable-component-update")  # 禁用组件更新
-                options.add_argument(
-                    "--disable-features=NetworkService"
-                )  # 禁用网络服务
-                options.add_argument(
-                    "--disable-domain-reliability"
-                )  # 禁用域名可靠性监控
-                options.add_argument(
-                    "--disable-client-side-phishing-detection"
-                )  # 禁用钓鱼检测
+    def is_connected(self) -> int:
+        """
+        检测网络连通性
+        返回: 0=已连接, 2=断网
+        """
+        try:
+            response_time = ping3.ping(self.host, timeout=2)
+        except Exception as e:
+            self.logger.warning(f"网络探测失败: {e}")
+            return 2
+        if response_time is not None:
+            self.logger.debug("网络连接正常 (●'◡'●)")
+            return 0
+        else:
+            self.logger.info("检测到断网 (っ °Д °;)っ")
+            return 2
 
-                driver = None
+    # --- 核心认证逻辑 ---
+
+    def _try_auth_post_form(self, portal_html: str, portal_url: str) -> Tuple[bool, str]:
+        """
+        策略A: 解析HTML中的表单, 按照表单结构POST提交
+        """
+        pf = parse_portal_html(portal_html, portal_url)
+        if pf is None:
+            return False, "无法解析门户页面表单"
+
+        data = {**pf.hidden_fields}
+        data[pf.username_field] = self.PHONENUM
+        data[pf.password_field] = self.PASSWD
+
+        self.logger.info(f"策略A: POST 表单到 {pf.action}")
+        self.logger.debug(f"  字段: username={pf.username_field}, password={pf.password_field}")
+        self.logger.debug(f"  hidden_fields: {list(pf.hidden_fields.keys())}")
+
+        try:
+            self._log_request_summary("POST", pf.action, data=data)
+            resp = self.session.post(pf.action, data=data, timeout=15, allow_redirects=True)
+            self._log_response(resp, "策略A")
+            return self._check_auth_response(resp)
+        except requests.RequestException as e:
+            return False, f"POST 请求失败: {e}"
+
+    def _try_auth_known_endpoints(self, base_url: str) -> Tuple[bool, str]:
+        """
+        策略B: 依次尝试已知认证端点
+        """
+        # 先从页面JS中探测端点
+        try:
+            resp = self.session.get(base_url, timeout=10, allow_redirects=True)
+            html = resp.text
+            js_endpoint = extract_js_login_endpoint(html)
+            if js_endpoint:
+                if not js_endpoint.startswith("http"):
+                    from urllib.parse import urljoin
+                    js_endpoint = urljoin(base_url, js_endpoint)
+                # 把 JS 探测到的端点放到最前面
+                if js_endpoint not in KNOWN_AUTH_ENDPOINTS:
+                    KNOWN_AUTH_ENDPOINTS.insert(0, js_endpoint)
+        except Exception:
+            pass
+
+        from urllib.parse import urljoin, urlsplit
+
+        eportal_query = urlsplit(base_url).query
+        if eportal_query:
+            self.logger.debug(f"ePortal queryString 已提取: {eportal_query[:300]}")
+
+        for endpoint in KNOWN_AUTH_ENDPOINTS:
+            full_url = urljoin(base_url, endpoint)
+            self.logger.info(f"策略B: 尝试已知端点 {full_url}")
+
+            # 常见 payload 格式
+            payloads = [
+                # 格式0: ePortal/Ruijie 常见 AJAX 登录格式，queryString 必须来自 index.jsp 的 URL 参数
+                {
+                    "userId": self.PHONENUM,
+                    "password": self.PASSWD,
+                    "service": "",
+                    "queryString": eportal_query,
+                    "operatorPwd": "",
+                    "operatorUserId": "",
+                    "validcode": "",
+                    "passwordEncrypt": "false",
+                },
+                # 格式1: 标准表单
+                {"username": self.PHONENUM, "pwd": self.PASSWD, "password": self.PASSWD},
+                # 格式2: eportal 简化格式
+                {"userId": self.PHONENUM, "password": self.PASSWD, "service": "", "queryString": eportal_query},
+                # 格式3: userPwd 模式
+                {"userAccount": self.PHONENUM, "userPassword": self.PASSWD},
+            ]
+
+            for payload in payloads:
                 try:
-                    driver = webdriver.Edge(service=Se, options=options)
-                    driver.get("http://aaa.uestc.edu.cn/")
-                    cnt.logger.info("连接中... 小孤独在努力连接中... (。・ω・。)")
-                    user_input = driver.find_element(
-                        by=By.XPATH, value='//*[@id="username"]'
+                    self._log_request_summary("POST", full_url, data=payload)
+                    resp = self.session.post(full_url, data=payload, timeout=10, allow_redirects=True)
+                    self._log_response(resp, "策略B")
+                    ok, msg = self._check_auth_response(resp)
+                    if ok:
+                        return True, msg
+                except requests.RequestException:
+                    continue
+
+        return False, "所有已知端点均失败"
+
+    def _try_auth_get_with_params(self, base_url: str) -> Tuple[bool, str]:
+        """
+        策略C: GET 请求带参数 (少数门户用GET认证)
+        """
+        params = {
+            "username": self.PHONENUM,
+            "pwd": self.PASSWD,
+            "password": self.PASSWD,
+        }
+        self.logger.info(f"策略C: GET 带参数 {base_url}")
+        try:
+            self._log_request_summary("GET", base_url, params=params)
+            resp = self.session.get(base_url, params=params, timeout=10, allow_redirects=True)
+            self._log_response(resp, "策略C")
+            return self._check_auth_response(resp)
+        except requests.RequestException as e:
+            return False, f"GET 请求失败: {e}"
+
+    def _try_auth_json_post(self, base_url: str) -> Tuple[bool, str]:
+        """
+        策略D: JSON POST (现代AJAX门户)
+        """
+        from urllib.parse import urljoin
+
+        for endpoint in KNOWN_AUTH_ENDPOINTS:
+            full_url = urljoin(base_url, endpoint)
+            payloads = [
+                {"username": self.PHONENUM, "password": self.PASSWD},
+                {"userId": self.PHONENUM, "password": self.PASSWD},
+                {"userAccount": self.PHONENUM, "userPassword": self.PASSWD},
+            ]
+            for payload in payloads:
+                try:
+                    self._log_request_summary("POST", full_url, json=payload)
+                    resp = self.session.post(
+                        full_url, json=payload, timeout=10, allow_redirects=True
                     )
-                    pw_input = driver.find_element(by=By.ID, value="pwd")
-                    login_btn = driver.find_element(by=By.ID, value="loginLink_div")
-                    user_input.send_keys(cnt.PHONENUM)
-                    driver.execute_script(f"arguments[0].value={cnt.PASSWD};", pw_input)
-                    time.sleep(0.5)
-                    login_btn.click()
-                    time.sleep(0.5)
-                    driver.quit()
-                    time.sleep(1)
-                    cnt.logger.info("连接成功!!! 喜多酱的吉他连接成功了！o((>ω< ))o")
-                    cnterror = 0
-                except Exception as e:
-                    cnt.logger.error(
-                        f"认证过程中发生错误: {e} 波奇酱搞砸了... (´；ω；`)"
-                    )
-                    # 如果认证失败，关闭driver（如果已创建）
-                    if driver is not None:
-                        try:
-                            driver.quit()
-                        except:
-                            pass
-            time.sleep(cnt.waitime)
-        time.sleep(cnt.waitime)
+                    self._log_response(resp, "策略D")
+                    ok, msg = self._check_auth_response(resp)
+                    if ok:
+                        return True, msg
+                except requests.RequestException:
+                    continue
+
+        return False, "JSON POST 均失败"
+
+    def _check_auth_response(self, resp: requests.Response) -> Tuple[bool, str]:
+        """
+        检查认证响应是否表示成功.
+        返回 (成功?, 描述消息)
+        """
+        status = resp.status_code
+        text = resp.text
+        url = resp.url
+
+        # HTTP 2xx
+        if 200 <= status < 400:
+            # 检查响应中是否包含成功标志
+            success_indicators = ["success", "登录成功", "认证成功", "已连接", "已登录"]
+            fail_indicators = ["fail", "error", "错误", "密码错误", "用户名或密码", "账号或密码"]
+
+            text_lower = text.lower()
+            for si in success_indicators:
+                if si.lower() in text_lower:
+                    return True, f"认证成功 (匹配到'{si}'), status={status}"
+
+            # 如果是 JSON 响应
+            try:
+                j = resp.json()
+                result = str(j.get("result", j.get("status", j.get("ret", "")))).lower()
+                if result in ("success", "0", "true", "ok"):
+                    return True, f"认证成功 (JSON result={result})"
+                elif result and result not in ("fail", "error", "-1", "false"):
+                    # 可能是不确定的结果, 但不是明确的失败
+                    pass
+            except Exception:
+                pass
+
+            # 检查是否有明确的失败
+            for fi in fail_indicators:
+                if fi.lower() in text_lower:
+                    return False, f"认证失败: 匹配到'{fi}', status={status}"
+
+            # 如果仍然停留在 ePortal/index.jsp，一般表示还在认证门户，不能当作成功。
+            url_lower = url.lower()
+            if "/eportal/" in url_lower and ("index.jsp" in url_lower or "userip=" in url_lower):
+                return False, f"仍在认证门户页面, status={status}"
+
+            # 如果响应很短且是2xx, 可能是重定向后的成功页面
+            # 检查是否还在门户页面 (如果不在, 说明认证可能成功)
+            portal_indicators = ["username", "password", "loginLink", "登录", "eportal", "userip="]
+            still_portal = any(p.lower() in text_lower for p in portal_indicators)
+            if not still_portal and len(text) < 5000:
+                return True, f"可能成功 (已离开门户页面), status={status}"
+
+            # 默认: 状态码正常但无法确认
+            self.logger.debug(f"不确定的响应: status={status}, len={len(text)}")
+            return False, f"响应状态正常但无法确认成功, status={status}"
+
+        return False, f"HTTP {status}"
+
+    # --- 主认证入口 ---
+
+    def authenticate(self) -> bool:
+        """
+        执行一次认证尝试, 使用多种策略回退.
+        返回 True 表示认证成功, False 表示失败.
+        """
+        self.session.cookies.clear()
+
+        # Step 1: 获取门户页面
+        self.logger.info(f"正在访问门户页面: {self.portal_url}")
+        try:
+            self._log_request_summary("GET", self.portal_url)
+            resp = self.session.get(self.portal_url, timeout=15, allow_redirects=True)
+            self._log_response(resp, "门户页面")
+            portal_html = resp.text
+            final_url = resp.url
+            self.logger.info(f"门户页面已获取: status={resp.status_code}, url={final_url}, len={len(portal_html)}")
+        except requests.RequestException as e:
+            self.logger.error(f"无法访问门户页面: {e}")
+            return False
+
+        # 如果页面没有登录表单，不能直接判定成功：
+        # 真实断网时 ePortal 可能返回乱码/压缩页面，导致关键字检测失败。
+        html_lower = portal_html.lower()
+        has_login_form = any(
+            kw in html_lower for kw in ["username", "loginlink", "password", "pwd", "登录", "eportal"]
+        )
+        if not has_login_form:
+            final_url_lower = final_url.lower()
+            looks_like_captive_portal = (
+                "/eportal/" in final_url_lower
+                or "index.jsp" in final_url_lower
+                or "userip=" in final_url_lower
+                or "nasip=" in final_url_lower
+            )
+            if not looks_like_captive_portal and self.is_connected() == 0:
+                self.logger.info("门户页面未包含登录表单，且网络已连通，判定为已认证")
+                return True
+            self.logger.warning(
+                "门户页面未识别到登录表单，但当前像是认证门户/断网状态，将继续尝试接口认证"
+            )
+
+        # Step 2: 依次尝试各种认证策略
+        strategies = [
+            ("策略A: HTML表单解析POST", lambda: self._try_auth_post_form(portal_html, final_url)),
+            ("策略B: 已知端点轮询", lambda: self._try_auth_known_endpoints(final_url)),
+            ("策略D: JSON POST", lambda: self._try_auth_json_post(final_url)),
+            ("策略C: GET参数", lambda: self._try_auth_get_with_params(final_url)),
+        ]
+
+        for name, strategy_fn in strategies:
+            self.logger.debug(f"决策链: 尝试 {name}")
+            try:
+                ok, msg = strategy_fn()
+                if ok:
+                    self._log_auth_decision(name, success=True, detail=msg)
+                    self.logger.info(f"{name} -> {msg}")
+                    return True
+                else:
+                    self._log_auth_decision(name, success=False, detail=msg)
+                    self.logger.warning(f"{name} -> {msg}")
+            except Exception as e:
+                self._log_auth_decision(name, success=False, detail=f"异常: {e}")
+                self.logger.warning(f"{name} -> 异常: {e}")
+                continue
+
+        self.logger.error("所有认证策略均失败")
+        return False
+
+    # --- 主循环 ---
+
+    def run(self):
+        """主循环: 周期性检测网络, 断网时自动认证"""
+        self.logger.info(f"主循环启动, 检测间隔={self.waitime}s")
+        cycle = 0
+        while True:
+            cycle += 1
+            # 检测网络
+            while self.is_connected() != 0:
+                self.logger.info(f"[周期#{cycle}] 检测到断网, 开始认证...")
+                if self.authenticate():
+                    self.logger.info(f"[周期#{cycle}] 认证成功! o((>ω< ))o")
+                    # 等待几秒让网络生效
+                    time.sleep(3)
+                    if self.is_connected() == 0:
+                        break
+                    self.logger.warning(f"[周期#{cycle}] 认证后仍无法连通, 将重试...")
+                else:
+                    self.logger.error(f"[周期#{cycle}] 认证失败, 等待后重试...")
+                time.sleep(self.waitime)
+
+            self.logger.debug(f"[周期#{cycle}] 网络正常, 等待{self.waitime}s")
+            time.sleep(self.waitime)
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    connector = ConnectRequests()
+    connector.run()
