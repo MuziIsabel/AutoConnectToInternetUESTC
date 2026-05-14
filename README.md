@@ -15,7 +15,7 @@
 
 ## 安装
 
-建议使用独立 Python / conda 环境。
+建议使用独立 Python 虚拟环境。
 
 ```bash
 pip install -r requirements.txt
@@ -59,12 +59,6 @@ python internetconnectuestc.py
 
 ```bash
 python internetconnectuestc.py --debug
-```
-
-如果你使用 conda 但 `conda activate` 不可用，可以直接指定环境中的 Python，例如：
-
-```powershell
-& "C:\Users\你的用户名\.conda\envs\internetconnect\python.exe" ".\internetconnectuestc.py" --debug
 ```
 
 ## 认证流程说明
@@ -158,7 +152,7 @@ ModuleNotFoundError: No module named 'ping3'
 pip install -r requirements.txt
 ```
 
-或使用正确 conda 环境中的 Python。
+或确认正在使用已安装依赖的 Python 环境。
 
 ### 认证失败
 
@@ -180,14 +174,6 @@ BOCCHI THE ROCK.log
 - `ePortal queryString 已提取`
 - `策略B: 尝试已知端点`
 - `result=success` 或失败 message
-
-### PowerShell 中 conda activate 失败
-
-可以不用 `conda activate`，直接调用环境里的 Python：
-
-```powershell
-& "C:\Users\你的用户名\.conda\envs\internetconnect\python.exe" ".\internetconnectuestc.py" --debug
-```
 
 ## 更新日志
 
