@@ -9,6 +9,9 @@ __pycache__/
 .env.*
 !.env.example
 
+# 运行时会话缓存（含 sessionId/IP/MAC，禁止入库）
+.uestc_session_state.json
+
 # Build artifacts
 dist/
 build/
@@ -23,3 +26,6 @@ edgedriver_win64.zip
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本地 AI 文档（不入库）
+AGENTS.md
