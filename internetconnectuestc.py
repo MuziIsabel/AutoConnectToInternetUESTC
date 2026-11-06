@@ -9,7 +9,7 @@
 配置: 通过 .env 文件或环境变量设置
   UESTC_PHONE              - 手机号/学号 (必填)
   UESTC_PASSWORD           - 密码 (必填)
-  UESTC_HOST               - ping 探测地址 (默认 223.5.5.5)
+  UESTC_HOST               - 备用 ping 地址 (默认 223.5.5.5, 仅旧逻辑用)
   UESTC_WAIT_TIME          - 主循环检测间隔秒数 (默认 10)
   UESTC_PORTAL_BASE        - 门户基址 (默认 http://110.184.24.61)
   UESTC_HEARTBEAT_INTERVAL - 在线状态心跳间隔秒数 (默认 60)
@@ -17,6 +17,10 @@
   UESTC_SESSION_STATE_PATH    - 本地会话缓存文件路径
   UESTC_LOG_PATH           - 日志文件路径
   UESTC_DEBUG              - DEBUG 日志开关 (默认 0)
+  UESTC_PROBE_URL          - 联网探测地址, 逗号分隔, 格式 url|期望码 (默认内置 204 端点)
+  UESTC_PROBE_TIMEOUT      - 单个探测请求超时秒数 (默认 5)
+  UESTC_PROBE_CONFIRM_FAIL - 连续探测失败几次才判定掉线 (默认 2)
+  UESTC_BACKOFF_MAX        - 认证失败指数退避上限秒数 (默认 300)
 """
 
 import time
@@ -26,7 +30,9 @@ import sys
 import re
 import json
 import base64
+import random
 import logging
+import logging.handlers
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 from urllib.parse import urljoin, urlsplit, parse_qsl, urlencode
@@ -179,6 +185,20 @@ class ConnectRequests:
     # 触发 AC 重定向用的外部探测地址 (会被劫持到门户)
     AC_PROBE_URL = "http://123.123.123.123/"
 
+    # —— 联网探测 (HTTP captive-portal detection) ——
+    # 仅当请求返回预期状态码时才算真正在线; 被校园网劫持时会返回门户页/3xx。
+    DEFAULT_PROBE_TARGETS = [
+        ("http://connect.rom.miui.com/generate_204", 204),
+        ("http://wifi.vivo.com.cn/generate_204", 204),
+        ("http://www.gstatic.com/generate_204", 204),
+        ("http://connectivitycheck.platform.hicloud.com/generate_204", 204),
+        ("http://www.msftconnecttest.com/connecttest.txt", 200),
+    ]
+    # sessionId 失效时, 用于重新捕获 flowSessionId/userIp/nasIp 的候选地址。
+    DEFAULT_AC_PROBE_URLS = [
+        "http://123.123.123.123/",
+    ]
+
     def __init__(self):
         loaded_env_path = _load_env_file()
         self.logger = self._log_config()
@@ -193,6 +213,15 @@ class ConnectRequests:
         self.waitime = _get_env_int("UESTC_WAIT_TIME", 10)
         self.portal_base = os.getenv("UESTC_PORTAL_BASE", self.DEFAULT_PORTAL_BASE).strip().rstrip("/")
         self.heartbeat_interval = _get_env_int("UESTC_HEARTBEAT_INTERVAL", 60)
+        # —— 联网探测 (HTTP 204 captive-portal detection) ——
+        self.probe_targets = self._parse_probe_targets(os.getenv("UESTC_PROBE_URL", ""))
+        self.probe_timeout = _get_env_int("UESTC_PROBE_TIMEOUT", 5)
+        self.probe_confirm_fail = _get_env_int("UESTC_PROBE_CONFIRM_FAIL", 2)
+        # —— 认证失败指数退避 ——
+        self.backoff_max = _get_env_int("UESTC_BACKOFF_MAX", 300)
+        self._auth_backoff = 0
+        # —— 单实例锁 ——
+        self._lock_handle = None
         # 会话缓存
         self.session_state_enabled = _get_env_bool("UESTC_SESSION_CACHE_ENABLED", True)
         self.session_state_path = _default_session_state_path()
@@ -292,7 +321,9 @@ class ConnectRequests:
             log_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception:
             log_path = Path.cwd() / "BOCCHI THE ROCK.log"
-        fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+        fh = logging.handlers.RotatingFileHandler(
+            log_path, mode="a", maxBytes=1_000_000, backupCount=5, encoding="utf-8"
+        )
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter(
             "%(asctime)s %(name)s:%(levelname)s:%(message)s",
@@ -309,6 +340,11 @@ class ConnectRequests:
         except (OSError, ValueError):
             real_console = False
         if real_console and not getattr(sys, "frozen", False):
+            # GBK 控制台无法编码颜文字/特殊符号, 用 replace 兜底避免 UnicodeEncodeError
+            try:
+                sys.stdout.reconfigure(errors="replace")
+            except Exception:
+                pass
             ch = logging.StreamHandler(sys.stdout)
             ch.setLevel(console_level)
             ch.setFormatter(logging.Formatter(
@@ -527,24 +563,111 @@ class ConnectRequests:
     # --- 网络探测 ---
 
     def is_connected(self) -> int:
+        """检测能否真正访问外网。
+
+        返回: 0=已连接(真在线), 2=断网/未认证
+
+        为什么不再单纯用 ping:
+          校园网 captive portal 认证前常"放行 ICMP、只劫持 80/443",
+          ping 通 != 能上网(假在线, 会导致永不重认证、用户打不开网页);
+          也可能禁 ICMP 造成假离线。
+        这里请求 generate_204 端点, 只有返回预期码(通常 204)才算在线;
+        被门户劫持时会返回 302 或 200+门户 HTML, 判为未认证。
         """
-        检测网络连通性
-        返回: 0=已连接, 2=断网
-        """
-        if ping3 is None:
-            self.logger.warning("ping3 未安装, 无法执行网络探测; 请先运行 pip install -r requirements.txt")
-            return 2
-        try:
-            response_time = ping3.ping(self.host, timeout=2)
-        except Exception as e:
-            self.logger.warning(f"网络探测失败: {e}")
-            return 2
-        if response_time is not None:
-            self.logger.debug("网络连接正常 (●'◡'●)")
+        ok, detail = self._probe_internet()
+        if ok:
+            self.logger.debug(f"网络连接正常 (●'◡'●) [{detail}]")
             return 0
+        self.logger.info(f"检测到断网/未认证 [{detail}] (っ °Д °;)っ")
+        return 2
+
+    @staticmethod
+    def _parse_probe_targets(raw: str) -> list:
+        """解析 UESTC_PROBE_URL: 形如 `url|204,url|200`; 无 | 时默认期望 204。"""
+        targets = []
+        if raw:
+            for part in raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                expected = 204
+                if "|" in part:
+                    url, _, code = part.partition("|")
+                    url = url.strip()
+                    code = code.strip()
+                    expected = int(code) if code.isdigit() else 204
+                else:
+                    url = part
+                if url:
+                    targets.append((url, expected))
+        if not targets:
+            targets = list(ConnectRequests.DEFAULT_PROBE_TARGETS)
+        return targets
+
+    def _probe_internet(self) -> Tuple[bool, str]:
+        """返回 (是否真在线, 说明)。任一探针返回预期状态码即判在线。"""
+        last = "无可用探针"
+        for url, expected in self.probe_targets:
+            try:
+                resp = self.session.get(url, timeout=self.probe_timeout, allow_redirects=False)
+            except requests.RequestException as e:
+                last = f"{url} 请求失败: {type(e).__name__}"
+                continue
+            code = resp.status_code
+            if code == expected:
+                return True, f"{url} -> {code}"
+            # 被劫持/未认证: 记下状态码继续试下一个
+            snippet = ""
+            try:
+                snippet = (resp.text or "")[:40].replace("\n", " ")
+            except Exception:
+                pass
+            last = f"{url} -> {code} (疑似被劫持) {snippet}".strip()
+        return False, last
+
+    def _next_backoff_delay(self) -> float:
+        """认证失败后的指数退避 (base=waitime, 翻倍至 backoff_max), 加抖动避免同步。"""
+        base = max(self.waitime, 5)
+        if self._auth_backoff <= 0:
+            self._auth_backoff = base
         else:
-            self.logger.info("检测到断网 (っ °Д °;)っ")
-            return 2
+            self._auth_backoff = min(self.backoff_max, self._auth_backoff * 2)
+        jitter = random.uniform(0, self._auth_backoff * 0.3)
+        return min(float(self.backoff_max), self._auth_backoff + jitter)
+
+    def acquire_single_instance_lock(self) -> bool:
+        """用 Windows 命名互斥量保证只有一个实例运行。
+
+        多实例会各自认证、互相顶掉对方的 sessionId(实测会加速失效), 故必须单实例。
+        命名互斥量比文件锁稳: 不依赖文件偏移, 进程退出由系统自动释放。
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+            ERROR_ALREADY_EXISTS = 183
+            handle = kernel32.CreateMutexW(None, False, "Local\\UESTC-AutoConnect-Singleton")
+            last_err = ctypes.get_last_error()
+            if not handle:
+                self.logger.warning("创建单实例互斥量失败, 跳过单实例检查")
+                return True
+            if last_err == ERROR_ALREADY_EXISTS:
+                self.logger.error("已有另一个实例在运行, 本进程退出 (单实例互斥量)")
+                try:
+                    kernel32.CloseHandle(handle)
+                except Exception:
+                    pass
+                return False
+            # 句柄需常驻, 进程结束时系统自动释放互斥量
+            self._lock_handle = handle
+            self.logger.debug(f"已获取单实例互斥量 (pid={os.getpid()})")
+            return True
+        except Exception as e:
+            self.logger.warning(f"单实例检查异常, 跳过: {e}")
+            return True
 
     # ===================================================================
     # CAS SSO 认证 (锐捷 SAM 5.0)
@@ -837,43 +960,67 @@ class ConnectRequests:
         return user_ip, f"ipAddr={self._mask_value(user_ip)}"
 
     def _rediscover_session(self) -> bool:
-        """sessionId 失效时, 通过 AC 重定向重新捕获 userIp/nasIp 并触发服务端分配新 sessionId。
+        """sessionId 失效时, 通过 AC 重定向重新捕获 userIp/nasIp/flowSessionId。
 
-        策略:
-          1. 访问 AC 探测地址 (http://123.123.123.123/), 被 AC 劫持重定向
-          2. 从重定向链里解析 userIp/nasIp
-          3. 如果当前有 sessionId, 用它重新走 getCurrentNode 让服务端刷新会话
-          4. 没有 sessionId 时, 此处无法创建 (创建接口未确认), 返回 False
+        策略(比旧版更抗造): 依次尝试多个探测地址(硬编码探测 IP + 门户基址),
+        跟随重定向, 扫描最终 URL、历史跳转 Location 里的查询参数:
+          - userIp / nasIp: AC 会附加
+          - flowSessionId / sessionId: 门户分配的会话
+        头部断网但已在线等场景下, 打开门户基址通常会被 302 到 CAS 登录页并带上 flowSessionId。
 
         返回 True 表示成功刷新了 session 元数据。
         """
         self.logger.info("触发 AC 重定向重新捕获 session 参数 (●'◡'●)...")
-        try:
-            resp = self.session.get(self.AC_PROBE_URL, timeout=10, allow_redirects=True)
-            final_url = resp.url
-            self.logger.debug(f"AC 探测最终落地: {self._sanitize_log_text(final_url)}")
-            # 从最终 URL 解析 userIp/nasIp
-            parsed = urlsplit(final_url)
-            query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-            new_user_ip = query_params.get("userIp") or query_params.get("userip") or ""
-            new_nas_ip = query_params.get("nasIp") or query_params.get("nasip") or ""
-            new_session_id = query_params.get("flowSessionId") or query_params.get("sessionId") or ""
-            if new_user_ip:
-                self.user_ip = new_user_ip
-            if new_nas_ip:
-                self.nas_ip = new_nas_ip
-            if new_session_id and new_session_id != self.session_id:
-                self.session_id = new_session_id
-                self.logger.info(f"AC 重定向捕获到新 sessionId: {self._mask_value(self.session_id)}")
-            if new_user_ip or new_nas_ip or new_session_id:
-                self._save_session_state("(AC 重定向捕获)")
-                return True
-            # AC 没有劫持 (可能已在线, 或网段不触发)
-            self.logger.debug("AC 探测未捕获到 session 参数 (可能已在线或网段未触发劫持)")
-            return False
-        except requests.RequestException as e:
-            self.logger.warning(f"AC 探测失败: {e}")
-            return False
+        candidates = list(ConnectRequests.DEFAULT_AC_PROBE_URLS)
+        if self.AC_PROBE_URL not in candidates:
+            candidates.insert(0, self.AC_PROBE_URL)
+        if self.portal_base and self.portal_base not in candidates:
+            candidates.append(self.portal_base)
+
+        for probe_url in candidates:
+            try:
+                resp = self.session.get(probe_url, timeout=10, allow_redirects=True)
+            except requests.RequestException as e:
+                self.logger.debug(f"AC 探测失败 {probe_url}: {e}")
+                continue
+
+            scan_urls = [resp.url]
+            for h in getattr(resp, "history", None) or []:
+                loc = h.headers.get("Location")
+                if loc:
+                    scan_urls.append(urljoin(str(h.url), loc))
+                scan_urls.append(getattr(h, "url", ""))
+
+            for u in scan_urls:
+                if not u:
+                    continue
+                try:
+                    parsed = urlsplit(u)
+                except Exception:
+                    continue
+                qp = dict(parse_qsl(parsed.query, keep_blank_values=True))
+                new_user_ip = qp.get("userIp") or qp.get("userip") or ""
+                new_nas_ip = qp.get("nasIp") or qp.get("nasip") or ""
+                new_session_id = qp.get("flowSessionId") or qp.get("sessionId") or ""
+                changed = False
+                if new_user_ip and new_user_ip != self.user_ip:
+                    self.user_ip = new_user_ip
+                    changed = True
+                if new_nas_ip and new_nas_ip != self.nas_ip:
+                    self.nas_ip = new_nas_ip
+                    changed = True
+                if new_session_id and new_session_id != self.session_id:
+                    self.session_id = new_session_id
+                    changed = True
+                    self.logger.info(f"AC 重定向捕获到新 sessionId: {self._mask_value(self.session_id)}")
+                if changed:
+                    self.logger.debug(f"AC 探测命中: {self._sanitize_log_text(probe_url)} -> {self._sanitize_log_text(resp.url)}")
+                    self._save_session_state("(AC 重定向捕获)")
+                    return True
+            self.logger.debug(f"探针 {self._sanitize_log_text(probe_url)} 未捕获 session 参数 (落地: {self._sanitize_log_text(resp.url)})")
+
+        self.logger.debug("所有 AC 探针均未捕获 session 参数 (可能已在线或网段未触发劫持)")
+        return False
 
     def authenticate(self) -> bool:
         """CAS SSO 认证主入口。
@@ -1079,37 +1226,61 @@ class ConnectRequests:
     # --- 主循环 ---
 
     def run(self):
-        """主循环: 周期性检测网络; 断网时走 CAS SSO 认证; 在线时定期心跳保活。"""
-        self.logger.info(f"主循环启动, 检测间隔={self.waitime}s, 心跳间隔={self.heartbeat_interval}s")
+        """主循环: 周期性探测外网; 确认断网时走 CAS SSO 认证(带指数退避); 在线时定期心跳保活。"""
+        self.logger.info(
+            f"主循环启动, 检测间隔={self.waitime}s, 心跳间隔={self.heartbeat_interval}s, "
+            f"确认失败阈值={self.probe_confirm_fail}, 退避上限={self.backoff_max}s"
+        )
         cycle = 0
         next_heartbeat_time = time.monotonic()
+        probe_fail = 0
 
         while True:
             cycle += 1
-            # 检测网络: 断网则认证
-            while self.is_connected() != 0:
-                self.logger.info(f"[周期#{cycle}] 检测到断网, 开始 CAS SSO 认证...")
+
+            # 1) 探测外网: 连续失败达到阈值才判掉线, 避免单次抖动误判
+            if self.is_connected() == 0:
+                probe_fail = 0
+            else:
+                probe_fail += 1
+                if probe_fail < self.probe_confirm_fail:
+                    self.logger.debug(
+                        f"[周期#{cycle}] 探测失败 {probe_fail}/{self.probe_confirm_fail}, 稍后复核"
+                    )
+                    time.sleep(min(self.waitime, 5))
+                    continue
+
+            # 2) 确认断网/未认证: 认证; 失败则指数退避, 避免高频刷认证
+            if probe_fail >= self.probe_confirm_fail:
+                self.logger.info(f"[周期#{cycle}] 确认无法上网, 开始 CAS SSO 认证...")
                 if self.authenticate():
+                    self._auth_backoff = 0
                     self.logger.info(f"[周期#{cycle}] 认证成功! o((>ω< ))o")
                     time.sleep(3)
                     if self.is_connected() == 0:
+                        probe_fail = 0
                         next_heartbeat_time = time.monotonic() + self.heartbeat_interval
-                        break
-                    self.logger.warning(f"[周期#{cycle}] 认证后仍无法连通, 将重试...")
+                    else:
+                        delay = self._next_backoff_delay()
+                        self.logger.warning(f"[周期#{cycle}] 认证后仍无法连通, {delay:.0f}s 后重试")
+                        time.sleep(delay)
+                        continue
                 else:
-                    self.logger.error(f"[周期#{cycle}] 认证失败, 等待后重试...")
-                time.sleep(self.waitime)
+                    delay = self._next_backoff_delay()
+                    self.logger.error(f"[周期#{cycle}] 认证失败, {delay:.0f}s 后重试 (指数退避)")
+                    time.sleep(delay)
+                    continue
 
-            # 在线时定期心跳: 检测会话是否失效
+            # 3) 在线: 定期心跳检测会话是否失效
             if time.monotonic() >= next_heartbeat_time:
                 state, detail = self.heartbeat_check()
                 if state == "offline":
-                    # 心跳显示离线: 优先用缓存 sessionId 重新认证自愈 (不等真断网)
                     self.logger.info(f"[周期#{cycle}] 心跳显示会话失效, 尝试主动重新认证: {detail}")
                     if self.authenticate():
+                        self._auth_backoff = 0
                         self.logger.info(f"[周期#{cycle}] 主动重新认证成功, 继续保活")
                     else:
-                        self.logger.warning(f"[周期#{cycle}] 主动重新认证失败, 等待下次断网触发")
+                        self.logger.warning(f"[周期#{cycle}] 主动重新认证失败, 等待下次探测触发")
                 elif state == "unknown":
                     self.logger.debug(f"[周期#{cycle}] 心跳状态未知: {detail}")
                 next_heartbeat_time = time.monotonic() + self.heartbeat_interval
@@ -1127,11 +1298,13 @@ if __name__ == "__main__":
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     try:
-        debug_mode = "--debug" in sys.argv or os.environ.get("UESTC_DEBUG", "").lower() in ("1", "true", "yes")
         probe_auth = "--probe-auth" in sys.argv
         connector = ConnectRequests()
         if probe_auth:
             raise SystemExit(0 if connector.probe_auth_once() else 1)
+        # 单实例锁: 防止多进程同时认证互相顶掉 sessionId
+        if not connector.acquire_single_instance_lock():
+            raise SystemExit(0)
         connector.run()
     except SystemExit:
         raise

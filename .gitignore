@@ -4,6 +4,9 @@ __pycache__/
 *.py[cod]
 *.log
 
+# 本地虚拟环境
+.venv/
+
 # Local credentials / environment
 .env
 .env.*
@@ -11,6 +14,7 @@ __pycache__/
 
 # 运行时会话缓存（含 sessionId/IP/MAC，禁止入库）
 .uestc_session_state.json
+.uestc.lock
 
 # Build artifacts
 dist/

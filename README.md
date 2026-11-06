@@ -70,6 +70,13 @@ pyinstaller -F -w --clean --noconfirm --collect-data certifi --collect-submodule
 
 ## 更新日志
 
+- **V4.1**：稳定性增强
+  - 联网探测改用 HTTP `generate_204`（captive-portal detection），避免"ping 通但上不了网"的假在线误判
+  - 连续探测失败阈值（默认 2 次）后才触发认证，避免单次抖动误判
+  - 认证失败指数退避（10→20→…上限 300s），避免高频刷认证、加速会话失效
+  - 单实例锁（`.uestc.lock`），防止多进程互相顶掉 sessionId
+  - 日志改为轮转（1MB × 5），保留崩溃现场
+  - sessionId 失效时多探针重新捕获（AC 探测 IP + 门户基址）
 - **V4.0**：适配学校现行门户，重写认证实现
 - V3.0：纯 requests 版（已失效）
 - V2.x：Selenium 版（已废弃）
